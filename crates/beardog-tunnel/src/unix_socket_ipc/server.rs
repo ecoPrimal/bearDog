@@ -442,18 +442,21 @@ impl UnixSocketIpcServer {
                     .await
                 {
                     Ok(Ok(1)) if peek[0] == b'{' && !self.require_btsp => {
+                        crate::ribocipher::record_unsignalled();
                         debug!(
                             "UDS peek: JSON-RPC detected (0x7B) — bypassing BTSP for local composition"
                         );
                         Box::new(PrefixedStream::new(peek[0], stream)) as Box<dyn PlatformStream>
                     }
                     Ok(Ok(1)) if peek[0] == b'{' && self.require_btsp => {
+                        crate::ribocipher::record_unsignalled();
                         debug!(
                             "UDS peek: JSON-RPC detected (0x7B) — BTSP required, routing to JSON-line handshake"
                         );
                         Box::new(PrefixedStream::new(peek[0], stream)) as Box<dyn PlatformStream>
                     }
                     Ok(Ok(1)) if crate::ribocipher::is_signal_byte(peek[0]) => {
+                        crate::ribocipher::record_signalled();
                         debug!(
                             signal = format!("0x{:02X}", peek[0]),
                             "UDS peek: riboCipher signal detected"

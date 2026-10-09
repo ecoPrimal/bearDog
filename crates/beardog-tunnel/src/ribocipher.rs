@@ -27,11 +27,55 @@
 //! Any connection NOT starting with 0xEC/0xED/0xEE logs WARN and falls
 //! through to existing peek logic during the deprecation window.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 pub use beardog_types::constants::domains::network::ribocipher::{
     PROTO_BTSP_BINARY, PROTO_BTSP_JSONLINE, PROTO_DARK_FOREST_BEACON, PROTO_ENCRYPTED_RESUME,
     PROTO_HTTP, PROTO_MESH_RELAY, PROTO_NDJSON_JSONRPC, PROTO_PROBE, SIGNAL_CLEAR, SIGNAL_MITO,
     SIGNAL_NUCLEAR, clear_signal,
 };
+
+// ── riboCipher enforcement tracking ─────────────────────────────────
+//
+// Count connections by signal tier to track migration progress.
+// When UNSIGNALLED_CONNECTIONS stays at 0 long enough, the `{` bypass
+// can be removed and `BEARDOG_UDS_REQUIRE_BTSP=1` becomes the default.
+
+/// Connections that arrived with a riboCipher signal prefix (0xEC/0xED/0xEE).
+pub static SIGNALLED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Connections that arrived without any riboCipher signal (first byte = `{`).
+pub static UNSIGNALLED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a connection that sent a riboCipher signal.
+pub fn record_signalled() {
+    SIGNALLED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a connection that did NOT send a riboCipher signal.
+pub fn record_unsignalled() {
+    UNSIGNALLED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot of riboCipher enforcement progress.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RiboCipherMetrics {
+    pub signalled: u64,
+    pub unsignalled: u64,
+    pub enforcement_ready: bool,
+}
+
+/// Get current riboCipher enforcement metrics.
+#[must_use]
+pub fn enforcement_metrics() -> RiboCipherMetrics {
+    let signalled = SIGNALLED_CONNECTIONS.load(Ordering::Relaxed);
+    let unsignalled = UNSIGNALLED_CONNECTIONS.load(Ordering::Relaxed);
+    RiboCipherMetrics {
+        signalled,
+        unsignalled,
+        enforcement_ready: unsignalled == 0 && signalled > 0,
+    }
+}
 
 /// Result of riboCipher signal detection on a connection's first bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]

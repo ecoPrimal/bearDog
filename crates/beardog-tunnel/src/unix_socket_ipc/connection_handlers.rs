@@ -223,6 +223,7 @@ impl UnixSocketIpcServer {
     #[cfg(all(unix, feature = "tarpc-rpc"))]
     async fn serve_tarpc_on_stream(&self, stream: Box<dyn PlatformStream>) -> Result<()> {
         use futures::StreamExt;
+        use crate::tarpc_service::BearDogRpc;
         use tarpc::server::{BaseChannel, Channel};
 
         let transport = tarpc::serde_transport::Transport::from((

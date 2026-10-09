@@ -281,4 +281,29 @@ mod tests {
         let garbage = [0xFF, 0xFE, 0xFD, 0xFC];
         assert_eq!(decode_mito_tag(seed, &garbage), None);
     }
+
+    #[test]
+    fn record_signalled_increments() {
+        let before = SIGNALLED_CONNECTIONS.load(Ordering::Relaxed);
+        record_signalled();
+        let after = SIGNALLED_CONNECTIONS.load(Ordering::Relaxed);
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn record_unsignalled_increments() {
+        let before = UNSIGNALLED_CONNECTIONS.load(Ordering::Relaxed);
+        record_unsignalled();
+        let after = UNSIGNALLED_CONNECTIONS.load(Ordering::Relaxed);
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn enforcement_metrics_serializes() {
+        let metrics = enforcement_metrics();
+        let json = serde_json::to_string(&metrics).expect("serialize");
+        assert!(json.contains("signalled"));
+        assert!(json.contains("unsignalled"));
+        assert!(json.contains("enforcement_ready"));
+    }
 }

@@ -465,14 +465,24 @@ impl UnixSocketIpcServer {
                     Ok(Ok(_)) => {
                         debug!("BTSP production: initiating UDS handshake");
                         let mut prefixed = PrefixedStream::new(peek[0], stream);
-                        match btsp_handshake::perform_server_handshake(&mut prefixed, family_seed)
-                            .await
+                        // Bind BirdSong lineage into session keys even for
+                        // direct BTSP connections (no riboCipher prefix).
+                        let binding = self.enrich_binding_with_lineage(
+                            btsp_handshake::TransportBinding::NONE,
+                            family_seed,
+                        );
+                        match btsp_handshake::perform_server_handshake_bound(
+                            &mut prefixed,
+                            family_seed,
+                            &binding,
+                        )
+                        .await
                         {
                             Ok(session) => {
                                 info!(
                                     session_id = %session.session_id,
                                     cipher = %session.cipher.wire_name(),
-                                    "BTSP handshake succeeded — switching to encrypted frames"
+                                    "BTSP handshake succeeded (lineage-bound)"
                                 );
                                 return self.handle_jsonrpc_btsp(Box::new(prefixed), session).await;
                             }

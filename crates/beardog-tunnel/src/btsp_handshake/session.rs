@@ -69,6 +69,11 @@ pub struct BtspSession {
     encrypt_counter: u64,
     /// Monotonic nonce counter for decrypt (client → server).
     decrypt_counter: u64,
+    /// riboCipher signal tier that authenticated this session's transport.
+    /// `0x00` = none (direct BTSP), `0xEC` = clear, `0xED` = mito, `0xEE` = nuclear.
+    pub transport_tier: u8,
+    /// Whether BirdSong lineage material was bound into session keys.
+    pub lineage_bound: bool,
 }
 
 impl BtspSession {
@@ -89,6 +94,8 @@ impl BtspSession {
             decrypt_key: client_to_server_key,
             encrypt_counter: 0,
             decrypt_counter: 0,
+            transport_tier: 0x00,
+            lineage_bound: false,
         }
     }
 
@@ -109,6 +116,8 @@ impl BtspSession {
             decrypt_key: server_to_client_key,
             encrypt_counter: 0,
             decrypt_counter: 0,
+            transport_tier: 0x00,
+            lineage_bound: false,
         }
     }
 

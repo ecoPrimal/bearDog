@@ -14,7 +14,11 @@ pub mod session_store;
 pub(crate) mod types;
 
 pub use framing::{read_frame, write_frame};
-pub use handshake::{continue_server_handshake_jsonline, perform_server_handshake};
+pub use crypto::TransportBinding;
+pub use handshake::{
+    continue_server_handshake_jsonline, continue_server_handshake_jsonline_bound,
+    perform_server_handshake, perform_server_handshake_bound,
+};
 pub use session::{BtspCipher, BtspSession, Phase3Session};
 pub use session_store::BtspSessionStore;
 pub use types::{ChallengeResponse, ClientHello, HandshakeComplete, HandshakeError, ServerHello};

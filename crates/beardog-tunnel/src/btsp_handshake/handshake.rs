@@ -6,7 +6,7 @@
 
 use super::FamilySeed;
 use super::crypto::{
-    compute_challenge_hmac, derive_handshake_key, derive_session_keys, generate_ephemeral_keypair,
+    compute_challenge_hmac, derive_handshake_key, generate_ephemeral_keypair,
     verify_challenge_response, x25519_shared_secret,
 };
 use super::framing::{read_frame, write_frame};
@@ -44,6 +44,29 @@ static BTSP_JSONLINE_READ_TIMEOUT: std::sync::LazyLock<std::time::Duration> =
 pub async fn perform_server_handshake<S>(
     stream: &mut S,
     family_seed: &FamilySeed,
+) -> Result<BtspSession, BearDogError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    perform_server_handshake_bound(stream, family_seed, &super::crypto::TransportBinding::NONE)
+        .await
+}
+
+/// Run the server side of the BTSP handshake with transport/lineage binding.
+///
+/// Same as [`perform_server_handshake`] but mixes riboCipher signal tier,
+/// mitoCipher HMAC tag, and BirdSong lineage material into the session key
+/// derivation. The binding is carried through the HKDF info parameter so
+/// session keys are cryptographically dependent on HOW the connection was
+/// authenticated at every layer.
+///
+/// # Errors
+///
+/// Returns an error if any step of the handshake fails.
+pub async fn perform_server_handshake_bound<S>(
+    stream: &mut S,
+    family_seed: &FamilySeed,
+    transport_binding: &super::crypto::TransportBinding,
 ) -> Result<BtspSession, BearDogError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -164,19 +187,31 @@ where
     debug!(session_id = %session_id, cipher = %cipher.wire_name(), "BTSP handshake complete");
 
     // ── Derive session keys from X25519 shared secret ──────────────────
+    // Session keys are bound to the transport authentication layer: the
+    // riboCipher signal tier, mitoCipher HMAC tag, and BirdSong lineage
+    // material all contribute to the HKDF info, creating a cryptographic
+    // chain from transport → handshake → session.
     let client_pub_array: [u8; 32] = client_pub_bytes
         .try_into()
         .map_err(|_| BearDogError::system("BTSP client key length mismatch".to_string()))?;
     let their_pub = x25519_dalek::PublicKey::from(client_pub_array);
     let shared_secret = x25519_shared_secret(&server_secret, &their_pub);
-    let keys = derive_session_keys(&shared_secret, session_id.as_bytes())?;
+    let keys = super::crypto::derive_session_keys_bound(
+        &shared_secret,
+        session_id.as_bytes(),
+        transport_binding,
+    )?;
 
-    Ok(BtspSession::new_server(
+    let mut session = BtspSession::new_server(
         session_id,
         cipher,
         keys.server_to_client,
         keys.client_to_server,
-    ))
+    );
+    session.transport_tier = transport_binding.signal_tier;
+    session.lineage_bound = transport_binding.lineage_hash != [0u8; 32];
+
+    Ok(session)
 }
 
 /// Best-effort: send a handshake error frame and swallow any I/O error.
@@ -212,6 +247,32 @@ pub async fn continue_server_handshake_jsonline<S>(
     stream: &mut S,
     client_hello: &ClientHello,
     family_seed: &FamilySeed,
+) -> Result<BtspSession, BearDogError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    continue_server_handshake_jsonline_bound(
+        stream,
+        client_hello,
+        family_seed,
+        &super::crypto::TransportBinding::NONE,
+    )
+    .await
+}
+
+/// JSON-line BTSP handshake with transport/lineage binding.
+///
+/// See [`continue_server_handshake_jsonline`] — this variant mixes
+/// riboCipher and BirdSong lineage material into session key derivation.
+///
+/// # Errors
+///
+/// Returns an error if any handshake step fails.
+pub async fn continue_server_handshake_jsonline_bound<S>(
+    stream: &mut S,
+    client_hello: &ClientHello,
+    family_seed: &FamilySeed,
+    transport_binding: &super::crypto::TransportBinding,
 ) -> Result<BtspSession, BearDogError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -303,20 +364,28 @@ where
         "BTSP handshake (JSON-line) complete"
     );
 
-    // ── Derive session keys ─────────────────────────────────────────────
+    // ── Derive session keys (transport + lineage bound) ────────────────
     let client_pub_array: [u8; 32] = client_pub_bytes
         .try_into()
         .map_err(|_| BearDogError::system("BTSP client key length mismatch".to_string()))?;
     let their_pub = x25519_dalek::PublicKey::from(client_pub_array);
     let shared_secret = x25519_shared_secret(&server_secret, &their_pub);
-    let keys = derive_session_keys(&shared_secret, session_id.as_bytes())?;
+    let keys = super::crypto::derive_session_keys_bound(
+        &shared_secret,
+        session_id.as_bytes(),
+        transport_binding,
+    )?;
 
-    Ok(BtspSession::new_server(
+    let mut session = BtspSession::new_server(
         session_id,
         cipher,
         keys.server_to_client,
         keys.client_to_server,
-    ))
+    );
+    session.transport_tier = transport_binding.signal_tier;
+    session.lineage_bound = transport_binding.lineage_hash != [0u8; 32];
+
+    Ok(session)
 }
 
 /// Write a JSON value as a newline-terminated line.

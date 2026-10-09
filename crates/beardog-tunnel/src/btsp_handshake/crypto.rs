@@ -113,9 +113,138 @@ pub fn derive_session_keys(
     shared_secret: &[u8; 32],
     session_id: &[u8],
 ) -> Result<SessionKeys, BearDogError> {
-    let hk = Hkdf::<Sha256>::new(Some(b"btsp-session-v1"), shared_secret);
+    derive_session_keys_bound(shared_secret, session_id, &TransportBinding::NONE)
+}
+
+/// Transport binding context — carries riboCipher signal tier and mito/lineage
+/// material into BTSP session key derivation.
+///
+/// When BTSP is entered via a riboCipher signal, the signal tier and any
+/// associated authentication material (mito HMAC tag, lineage proof) are
+/// cryptographically bound into the session keys via the HKDF info parameter.
+/// This ensures the session keys differ based on HOW the connection was
+/// authenticated at the transport layer — a session entered via mitoCipher
+/// produces different keys than one entered via clear signal or no signal.
+///
+/// # Wire Format Binding
+///
+/// ```text
+/// info = session_id || transport_tag
+/// transport_tag = [tier_byte, proto_byte, mito_tag[4], lineage_hash[32]]
+///               = 38 bytes (or 0 bytes when NONE)
+/// ```
+pub struct TransportBinding {
+    /// riboCipher signal tier: 0xEC (clear), 0xED (mito), 0xEE (nuclear), 0x00 (none).
+    pub signal_tier: u8,
+    /// Protocol type byte from the riboCipher signal (e.g. `PROTO_BTSP_BINARY`).
+    pub protocol_type: u8,
+    /// 4-byte mito HMAC tag (all zeros for clear/none tier).
+    pub mito_tag: [u8; 4],
+    /// 32-byte BLAKE3 hash of lineage proof material from BirdSong genetics.
+    /// All zeros when no lineage material is available.
+    pub lineage_hash: [u8; 32],
+}
+
+impl TransportBinding {
+    /// No transport binding — legacy connections without riboCipher signal.
+    pub const NONE: Self = Self {
+        signal_tier: 0x00,
+        protocol_type: 0x00,
+        mito_tag: [0u8; 4],
+        lineage_hash: [0u8; 32],
+    };
+
+    /// Build a binding from a clear riboCipher signal.
+    #[must_use]
+    pub const fn clear(protocol_type: u8) -> Self {
+        Self {
+            signal_tier: 0xEC,
+            protocol_type,
+            mito_tag: [0u8; 4],
+            lineage_hash: [0u8; 32],
+        }
+    }
+
+    /// Build a binding from a mito-obfuscated riboCipher signal.
+    #[must_use]
+    pub const fn mito(protocol_type: u8, mito_tag: [u8; 4]) -> Self {
+        Self {
+            signal_tier: 0xED,
+            protocol_type,
+            mito_tag,
+            lineage_hash: [0u8; 32],
+        }
+    }
+
+    /// Attach BirdSong lineage hash to an existing binding.
+    #[must_use]
+    pub const fn with_lineage(mut self, lineage_hash: [u8; 32]) -> Self {
+        self.lineage_hash = lineage_hash;
+        self
+    }
+
+    /// Serialize the binding as a fixed-length tag for HKDF info mixing.
+    /// Returns empty slice for `NONE` (backward compatible with unbound sessions).
+    fn as_tag(&self) -> Vec<u8> {
+        if self.signal_tier == 0x00
+            && self.mito_tag == [0u8; 4]
+            && self.lineage_hash == [0u8; 32]
+        {
+            return Vec::new();
+        }
+        let mut tag = Vec::with_capacity(38);
+        tag.push(self.signal_tier);
+        tag.push(self.protocol_type);
+        tag.extend_from_slice(&self.mito_tag);
+        tag.extend_from_slice(&self.lineage_hash);
+        tag
+    }
+}
+
+/// Derive directional session keys with transport and lineage binding.
+///
+/// Extends the standard `derive_session_keys` by mixing the [`TransportBinding`]
+/// into the HKDF info parameter. This cryptographically binds the riboCipher
+/// signal tier, mito authentication tag, and BirdSong lineage material into the
+/// session keys — ensuring that BOTH the IPC transport authentication (riboCipher
+/// + mitoCipher) and the genetic identity (BirdSong lineage) contribute to the
+/// session's cryptographic foundation.
+///
+/// ```text
+/// HKDF-SHA256(
+///     ikm  = shared_secret,
+///     salt = "btsp-session-v2",
+///     info = session_id || transport_tag,
+/// ) → 64 bytes → (server_to_client[32], client_to_server[32])
+/// ```
+///
+/// When `binding` is `TransportBinding::NONE`, falls back to v1 salt for
+/// backward compatibility with unbound sessions.
+///
+/// # Errors
+///
+/// Returns an error if HKDF expansion fails.
+pub fn derive_session_keys_bound(
+    shared_secret: &[u8; 32],
+    session_id: &[u8],
+    binding: &TransportBinding,
+) -> Result<SessionKeys, BearDogError> {
+    let transport_tag = binding.as_tag();
+
+    let salt = if transport_tag.is_empty() {
+        b"btsp-session-v1".as_slice()
+    } else {
+        b"btsp-session-v2".as_slice()
+    };
+
+    let hk = Hkdf::<Sha256>::new(Some(salt), shared_secret);
+
+    let mut info = Vec::with_capacity(session_id.len() + transport_tag.len());
+    info.extend_from_slice(session_id);
+    info.extend_from_slice(&transport_tag);
+
     let mut okm = [0u8; 64];
-    hk.expand(session_id, &mut okm)
+    hk.expand(&info, &mut okm)
         .map_err(|e| BearDogError::system(format!("BTSP session key derivation failed: {e}")))?;
 
     let mut server_to_client = [0u8; 32];
@@ -306,5 +435,121 @@ mod tests {
         let short = [0u8; 31];
         let err = verify_challenge_response(&hk, challenge, &cp, &sp, &short).expect_err("short");
         assert!(err.to_string().contains("family") || err.to_string().contains("verification"));
+    }
+
+    // ── TransportBinding tests ─────────────────────────────────────────
+
+    #[test]
+    fn transport_binding_none_produces_empty_tag() {
+        assert!(TransportBinding::NONE.as_tag().is_empty());
+    }
+
+    #[test]
+    fn transport_binding_clear_produces_38_byte_tag() {
+        let b = TransportBinding::clear(0x02);
+        let tag = b.as_tag();
+        assert_eq!(tag.len(), 38);
+        assert_eq!(tag[0], 0xEC); // signal tier
+        assert_eq!(tag[1], 0x02); // protocol type
+        assert_eq!(&tag[2..6], &[0u8; 4]); // no mito tag
+        assert_eq!(&tag[6..38], &[0u8; 32]); // no lineage
+    }
+
+    #[test]
+    fn transport_binding_mito_carries_tag() {
+        let mito_tag = [0xDE, 0xAD, 0xBE, 0xEF];
+        let b = TransportBinding::mito(0x02, mito_tag);
+        let tag = b.as_tag();
+        assert_eq!(tag[0], 0xED); // mito tier
+        assert_eq!(&tag[2..6], &mito_tag);
+    }
+
+    #[test]
+    fn transport_binding_with_lineage_fills_tail() {
+        let lineage = [0x42u8; 32];
+        let b = TransportBinding::clear(0x02).with_lineage(lineage);
+        let tag = b.as_tag();
+        assert_eq!(&tag[6..38], &lineage);
+    }
+
+    #[test]
+    fn bound_keys_differ_from_unbound() {
+        let shared = [0x42; 32];
+        let sid = b"session-id";
+
+        let unbound = derive_session_keys(&shared, sid).expect("unbound");
+        let bound = derive_session_keys_bound(
+            &shared,
+            sid,
+            &TransportBinding::clear(0x02),
+        )
+        .expect("bound");
+
+        // Different salt ("btsp-session-v1" vs "btsp-session-v2") + different
+        // info (session_id vs session_id || transport_tag) → different keys.
+        assert_ne!(unbound.server_to_client, bound.server_to_client);
+        assert_ne!(unbound.client_to_server, bound.client_to_server);
+    }
+
+    #[test]
+    fn bound_keys_differ_by_tier() {
+        let shared = [0x42; 32];
+        let sid = b"session-id";
+
+        let clear = derive_session_keys_bound(
+            &shared,
+            sid,
+            &TransportBinding::clear(0x02),
+        )
+        .expect("clear");
+
+        let mito = derive_session_keys_bound(
+            &shared,
+            sid,
+            &TransportBinding::mito(0x02, [0xAA; 4]),
+        )
+        .expect("mito");
+
+        assert_ne!(clear.server_to_client, mito.server_to_client);
+    }
+
+    #[test]
+    fn bound_keys_differ_by_lineage() {
+        let shared = [0x42; 32];
+        let sid = b"session-id";
+
+        let no_lineage = derive_session_keys_bound(
+            &shared,
+            sid,
+            &TransportBinding::clear(0x02),
+        )
+        .expect("no_lineage");
+
+        let with_lineage = derive_session_keys_bound(
+            &shared,
+            sid,
+            &TransportBinding::clear(0x02).with_lineage([0xFF; 32]),
+        )
+        .expect("with_lineage");
+
+        assert_ne!(no_lineage.server_to_client, with_lineage.server_to_client);
+    }
+
+    #[test]
+    fn bound_none_matches_unbound() {
+        let shared = [0x42; 32];
+        let sid = b"session-id";
+
+        let unbound = derive_session_keys(&shared, sid).expect("unbound");
+        let bound_none = derive_session_keys_bound(
+            &shared,
+            sid,
+            &TransportBinding::NONE,
+        )
+        .expect("bound_none");
+
+        // NONE binding falls back to v1 salt → same keys as unbound
+        assert_eq!(unbound.server_to_client, bound_none.server_to_client);
+        assert_eq!(unbound.client_to_server, bound_none.client_to_server);
     }
 }

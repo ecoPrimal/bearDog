@@ -46,8 +46,15 @@ impl UnixSocketIpcServer {
                     "riboCipher: clear signal — routing"
                 );
 
-                self.dispatch_by_protocol(stream, protocol_type, family_seed, "clear")
-                    .await
+                let binding = btsp_handshake::TransportBinding::clear(protocol_type);
+                self.dispatch_by_protocol(
+                    stream,
+                    protocol_type,
+                    family_seed,
+                    "clear",
+                    binding,
+                )
+                .await
             }
             ribocipher::SIGNAL_MITO => {
                 let mut tag = [0u8; 4];
@@ -61,8 +68,15 @@ impl UnixSocketIpcServer {
                         tag = format!("{:02X}{:02X}{:02X}{:02X}", tag[0], tag[1], tag[2], tag[3]),
                         "riboCipher: mito-beacon decoded — routing"
                     );
-                    self.dispatch_by_protocol(stream, protocol_type, family_seed, "mito")
-                        .await
+                    let binding = btsp_handshake::TransportBinding::mito(protocol_type, tag);
+                    self.dispatch_by_protocol(
+                        stream,
+                        protocol_type,
+                        family_seed,
+                        "mito",
+                        binding,
+                    )
+                    .await
                 } else {
                     warn!(
                         tag = format!("{:02X}{:02X}{:02X}{:02X}", tag[0], tag[1], tag[2], tag[3]),
@@ -84,22 +98,38 @@ impl UnixSocketIpcServer {
 
     /// Dispatch to the appropriate handler based on the decoded riboCipher
     /// protocol type. Shared by both clear and mito-beacon signal paths.
+    ///
+    /// When BTSP is the target protocol, the riboCipher signal tier, mito
+    /// HMAC tag, and BirdSong lineage material are bound into the session
+    /// key derivation — ensuring both cipher systems (ribo + mito) and
+    /// bearDog genetics contribute to session security.
     async fn dispatch_by_protocol(
         &self,
         mut stream: Box<dyn PlatformStream>,
         protocol_type: u8,
         family_seed: &btsp_handshake::FamilySeed,
         tier_label: &str,
+        binding: btsp_handshake::TransportBinding,
     ) -> Result<()> {
         match protocol_type {
             ribocipher::PROTO_NDJSON_JSONRPC => self.handle_jsonrpc_universal("", stream).await,
             ribocipher::PROTO_BTSP_BINARY => {
-                match btsp_handshake::perform_server_handshake(&mut stream, family_seed).await {
+                // Enrich binding with BirdSong lineage hash if genetics are available
+                let binding = self.enrich_binding_with_lineage(binding, family_seed);
+
+                match btsp_handshake::perform_server_handshake_bound(
+                    &mut stream,
+                    family_seed,
+                    &binding,
+                )
+                .await
+                {
                     Ok(session) => {
                         info!(
                             session_id = %session.session_id,
                             cipher = %session.cipher.wire_name(),
-                            "{tier_label}→BTSP handshake succeeded"
+                            transport_tier = tier_label,
+                            "BTSP handshake succeeded (transport-bound)"
                         );
                         self.handle_jsonrpc_btsp(stream, session).await
                     }
@@ -149,6 +179,56 @@ impl UnixSocketIpcServer {
                 Ok(())
             }
         }
+    }
+
+    /// Enrich a [`TransportBinding`] with BirdSong lineage material from
+    /// bearDog genetics.
+    ///
+    /// When the `btsp_provider`'s BirdSong manager has active lineage chains,
+    /// this method derives a 32-byte lineage hash from the family seed and
+    /// the first chain's root node. This binds the primal's genetic identity
+    /// into the BTSP session key derivation — a session on a primal with
+    /// lineage chain `alpha` produces different keys than one without.
+    ///
+    /// If no lineage chains are available (e.g. fresh install before enrollment),
+    /// the binding is returned unchanged (graceful degradation).
+    pub(super) fn enrich_binding_with_lineage(
+        &self,
+        binding: btsp_handshake::TransportBinding,
+        family_seed: &btsp_handshake::FamilySeed,
+    ) -> btsp_handshake::TransportBinding {
+        let birdsong = self.btsp_provider.birdsong_manager();
+        let chains = birdsong.list_lineage_chains();
+
+        if chains.is_empty() {
+            debug!("BTSP lineage binding: no lineage chains — using transport-only binding");
+            return binding;
+        }
+
+        // Derive a lineage hash from family_seed + first chain ID.
+        // HMAC-SHA256 keyed hash ensures the binding is unique per family × lineage.
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let chain_id = &chains[0].chain_id;
+        let Ok(mut mac) = HmacSha256::new_from_slice(family_seed.as_bytes()) else {
+            warn!("BTSP lineage binding: HMAC key error — using transport-only binding");
+            return binding;
+        };
+        mac.update(b"btsp-lineage-binding-v1");
+        mac.update(chain_id.as_bytes());
+        let result = mac.finalize().into_bytes();
+
+        let mut lineage_hash = [0u8; 32];
+        lineage_hash.copy_from_slice(&result);
+
+        debug!(
+            chain_id = %chain_id,
+            "BTSP lineage binding: BirdSong lineage hash derived"
+        );
+
+        binding.with_lineage(lineage_hash)
     }
 
     /// Handle G65 protocol negotiation.
@@ -363,10 +443,17 @@ impl UnixSocketIpcServer {
         client_hello: &btsp_handshake::ClientHello,
         family_seed: &btsp_handshake::FamilySeed,
     ) -> Result<()> {
-        match btsp_handshake::continue_server_handshake_jsonline(
+        // Enrich with BirdSong lineage material for genetics-bound sessions
+        let binding = self.enrich_binding_with_lineage(
+            btsp_handshake::TransportBinding::NONE,
+            family_seed,
+        );
+
+        match btsp_handshake::continue_server_handshake_jsonline_bound(
             &mut stream,
             client_hello,
             family_seed,
+            &binding,
         )
         .await
         {
@@ -374,7 +461,7 @@ impl UnixSocketIpcServer {
                 info!(
                     session_id = %session.session_id,
                     cipher = %session.cipher.wire_name(),
-                    "BTSP handshake succeeded (JSON-line framed)"
+                    "BTSP handshake succeeded (JSON-line, lineage-bound)"
                 );
                 if session.cipher == btsp_handshake::BtspCipher::Null {
                     self.handle_jsonrpc_ndjson_loop(stream).await

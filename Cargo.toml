@@ -257,6 +257,9 @@ beardog-threat = { version = "0.9.0", path = "crates/beardog-threat" }
 beardog-compliance = { version = "0.9.0", path = "crates/beardog-compliance" }
 beardog-acme = { version = "0.9.0", path = "crates/beardog-acme" }
 
+# Ecosystem shared types (cellMembrane canonical definitions)
+cellmembrane-types = { path = "../../gardens/cellMembrane/crates/cellmembrane-types" }
+
 [package]
 name = "beardog"
 readme = "README.md"

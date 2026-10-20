@@ -59,7 +59,6 @@
 //!   ChaCha20, Blake3                       APIs, AI providers
 //! ```
 
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -374,27 +373,9 @@ impl Client {
     }
 }
 
-/// JSON-RPC 2.0 Response
-#[derive(Debug, Deserialize)]
-struct JsonRpcResponse {
-    #[serde(rename = "jsonrpc")]
-    _jsonrpc: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-    #[serde(rename = "id")]
-    _id: Value,
-}
-
-/// JSON-RPC 2.0 Error
-#[derive(Debug, Deserialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
-}
+// JSON-RPC 2.0 types — canonical definitions from cellmembrane-types.
+// JsonRpcError is resolved transitively via JsonRpcResponse::error field.
+use cellmembrane_types::ecosystem::JsonRpcResponse;
 
 #[cfg(test)]
 mod tests {
